@@ -1,0 +1,18 @@
+[package]
+name = "sbus-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Command line monitor, capture and replay tool for Futaba S.BUS / S.BUS2"
+
+[[bin]]
+name = "sbus-monitor"
+path = "src/main.rs"
+
+[dependencies]
+sbus = { workspace = true }
+sbus-protocol = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.11"

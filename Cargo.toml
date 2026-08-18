@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sbus-protocol",
+    "crates/sbus",
+    "crates/sbus-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Takara Kasai <takara.kasai@gmail.com>"]
+repository = "https://github.com/kasai-takara/sbus-rs"
+
+[workspace.dependencies]
+sbus-protocol = { path = "crates/sbus-protocol", version = "0.1.0" }
+sbus = { path = "crates/sbus", version = "0.1.0" }
+serialport = "4"
+thiserror = "2"
+log = "0.4"
+libc = "0.2"
