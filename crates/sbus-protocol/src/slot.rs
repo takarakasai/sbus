@@ -14,20 +14,33 @@ pub const SLOT_COUNT: usize = 32;
 /// Slots per footer group.
 pub const SLOTS_PER_GROUP: usize = 8;
 
-/// Slot 0 data byte 0 selecting the receiver supply voltage ("Rx-Batt").
+/// Slot 0 marker with the value's high bits masked off, selecting the
+/// receiver supply voltage ("Rx-Batt").
 pub const MARKER_RX_BATTERY: u8 = 0xC0;
 
-/// Slot 0 data byte 0 selecting the external voltage input ("Ext-Volt").
+/// Slot 0 marker with the value's high bits masked off, selecting the
+/// external voltage input ("Ext-Volt").
 pub const MARKER_EXTERNAL_VOLTAGE: u8 = 0xC4;
 
-/// Volts per LSB of the slot 0 voltage byte.
+/// Marker bits that select the sensor, i.e. everything but the value's
+/// high bits.
+pub const MARKER_SENSOR_MASK: u8 = 0xFC;
+
+/// Marker bits holding bits 9..8 of the voltage.
+///
+/// The measurement is 10 bits: bits 7..0 in the value byte, bits 9..8 in the
+/// low two bits of the marker. Both verified captures below 25.6 V had these
+/// bits clear, which is why an 8-bit reading fitted them (`doc/spec.md` §5.2).
+pub const MARKER_VALUE_HIGH_MASK: u8 = 0x03;
+
+/// Volts per LSB of the slot 0 voltage value.
 pub const VOLT_LSB_V: f32 = 0.1;
 
-/// Highest voltage representable by the 8-bit slot 0 value.
+/// Highest voltage representable by the 10-bit slot 0 value.
 ///
-/// Measurements only reach 24.1 V, just under this ceiling; what a receiver
-/// does above it has not been verified (`doc/spec.md` §7-1).
-pub const VOLT_MAX_V: f32 = 25.5;
+/// Covers the 0–70 V the receiver's manual gives for the external voltage
+/// input. What happens above this has not been verified (`doc/spec.md` §7-1).
+pub const VOLT_MAX_V: f32 = 102.3;
 
 /// Reverse the low 6 bits of `value`.
 const fn reverse_bits_6(value: u8) -> u8 {
@@ -76,25 +89,25 @@ pub const fn slot_index(id: u8) -> Option<u8> {
 /// Decoded meaning of a slot response's two data bytes.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Telemetry {
-    /// Slot 0, marker `0xC0` — receiver supply voltage, shown as "Rx-Batt".
+    /// Slot 0, marker `0xC0..=0xC3` — receiver supply voltage, "Rx-Batt".
     RxBattery {
         /// Volts.
         volts: f32,
-        /// Raw 0.1 V/LSB byte.
-        raw: u8,
+        /// Raw 10-bit 0.1 V/LSB value.
+        raw: u16,
     },
-    /// Slot 0, marker `0xC4` — external voltage input, shown as "Ext-Volt".
+    /// Slot 0, marker `0xC4..=0xC7` — external voltage input, "Ext-Volt".
     ExternalVoltage {
         /// Volts.
         volts: f32,
-        /// Raw 0.1 V/LSB byte.
-        raw: u8,
+        /// Raw 10-bit 0.1 V/LSB value.
+        raw: u16,
     },
     /// A structurally valid slot response with no verified decode.
     ///
     /// Reached for every slot other than 0, and for slot 0 with an unexpected
     /// marker. Kept rather than dropped so callers can count and dump it —
-    /// a marker change above 25.5 V would show up here.
+    /// a marker change above 102.3 V would show up here.
     Unknown {
         /// The two data bytes, as received.
         data: [u8; 2],
@@ -127,8 +140,13 @@ pub struct SlotResponse {
 /// Division by 10 rather than multiplication by `0.1_f32`: the latter is not
 /// exact in binary, so 241 would decode to a value that is not bit-identical
 /// to the literal `24.1_f32`, making test and display comparisons awkward.
-fn volts_from_raw(raw: u8) -> f32 {
+fn volts_from_raw(raw: u16) -> f32 {
     raw as f32 / 10.0
+}
+
+/// Assemble the 10-bit voltage from a slot 0 marker and value byte.
+fn raw_voltage(data: [u8; 2]) -> u16 {
+    (((data[0] & MARKER_VALUE_HIGH_MASK) as u16) << 8) | data[1] as u16
 }
 
 impl SlotResponse {
@@ -137,14 +155,14 @@ impl SlotResponse {
     pub fn decode(bytes: &[u8; SLOT_LEN]) -> Option<SlotResponse> {
         let index = slot_index(bytes[0])?;
         let data = [bytes[1], bytes[2]];
-        let telemetry = match (index, data[0]) {
+        let telemetry = match (index, data[0] & MARKER_SENSOR_MASK) {
             (0, MARKER_RX_BATTERY) => Telemetry::RxBattery {
-                volts: volts_from_raw(data[1]),
-                raw: data[1],
+                volts: volts_from_raw(raw_voltage(data)),
+                raw: raw_voltage(data),
             },
             (0, MARKER_EXTERNAL_VOLTAGE) => Telemetry::ExternalVoltage {
-                volts: volts_from_raw(data[1]),
-                raw: data[1],
+                volts: volts_from_raw(raw_voltage(data)),
+                raw: raw_voltage(data),
             },
             _ => Telemetry::Unknown { data },
         };
@@ -232,7 +250,7 @@ mod tests {
             r.telemetry,
             Telemetry::RxBattery {
                 volts: 4.9,
-                raw: 0x31
+                raw: 49
             }
         );
     }
@@ -246,16 +264,56 @@ mod tests {
             r.telemetry,
             Telemetry::ExternalVoltage {
                 volts: 24.1,
-                raw: 0xF1
+                raw: 241
             }
         );
         assert_eq!(r.telemetry.volts(), Some(24.1));
     }
 
+    /// The capture that settled the encoding: a bench supply set to 26.0 V on
+    /// the external input, which is above the 25.5 V an 8-bit value can reach.
+    /// The marker moved `0xC4` → `0xC5`, putting bit 8 of the value there.
+    #[test]
+    fn decodes_external_voltage_above_the_8bit_ceiling() {
+        let r = SlotResponse::decode(&[0x03, 0xC5, 0x04]).unwrap();
+        assert_eq!(
+            r.telemetry,
+            Telemetry::ExternalVoltage {
+                volts: 26.0,
+                raw: 260
+            }
+        );
+        // The same capture jittered by one LSB, as it did at 24.1 V.
+        let r = SlotResponse::decode(&[0x03, 0xC5, 0x03]).unwrap();
+        assert_eq!(r.telemetry.volts(), Some(25.9));
+    }
+
+    /// Rx-Batt uses the same two marker bits, so a high supply would decode
+    /// the same way. Not observed — the rail is a regulated 5 V — but the
+    /// encoding is shared and must not be special-cased.
+    #[test]
+    fn rx_battery_uses_the_same_high_bits() {
+        let r = SlotResponse::decode(&[0x03, 0xC1, 0x2C]).unwrap();
+        assert_eq!(r.telemetry.volts(), Some(30.0));
+    }
+
     #[test]
     fn voltage_scale_is_exact_at_endpoints() {
         assert_eq!(volts_from_raw(0), 0.0);
-        assert_eq!(volts_from_raw(255), VOLT_MAX_V);
+        assert_eq!(volts_from_raw(1023), VOLT_MAX_V);
+    }
+
+    #[test]
+    fn marker_high_bits_are_the_value_not_the_sensor() {
+        // All four Ext-Volt markers select the same sensor.
+        for (marker, expect) in [(0xC4, 0.4), (0xC5, 26.0), (0xC6, 51.6), (0xC7, 77.2)] {
+            let r = SlotResponse::decode(&[0x03, marker, 0x04]).unwrap();
+            let volts = match r.telemetry {
+                Telemetry::ExternalVoltage { volts, .. } => volts,
+                other => panic!("0x{marker:02X} decoded as {other:?}"),
+            };
+            assert_eq!(volts, expect, "marker 0x{marker:02X}");
+        }
     }
 
     #[test]
